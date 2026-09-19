@@ -145,6 +145,193 @@ def test_invalid_leap_day():
     assert parse("17250229").status_code == 422  # 2025 is not a leap year
 
 
+# ----------------------------------------------- weight family 310n / 320n
+
+
+def test_weight_kg_implied_three_decimals():
+    resp = parse("3103002513")  # 002513 with 3 decimals -> 2.513 kg
+    assert resp.status_code == 200
+    element = resp.json()["elements"][0]
+    assert element == {
+        "ai": "3103",
+        "name": "NET WEIGHT (KG)",
+        "value": "002513",  # original 6 digits preserved
+        "decimal_value": 2.513,
+        "unit": "kg",
+        "offset": 0,
+    }
+
+
+def test_weight_lb_implied_two_decimals():
+    resp = parse("3202002513")  # 002513 with 2 decimals -> 25.13 lb
+    assert resp.status_code == 200
+    element = resp.json()["elements"][0]
+    assert element["ai"] == "3202"
+    assert element["name"] == "NET WEIGHT (LB)"
+    assert element["value"] == "002513"
+    assert element["decimal_value"] == 25.13
+    assert element["unit"] == "lb"
+
+
+def test_weight_n_zero_is_plain_integer():
+    resp = parse("3100012345")
+    assert resp.status_code == 200
+    element = resp.json()["elements"][0]
+    assert element["value"] == "012345"
+    assert element["decimal_value"] == 12345.0
+    assert element["unit"] == "kg"
+
+
+def test_weight_n_six_places():
+    resp = parse("3106123456")
+    assert resp.json()["elements"][0]["decimal_value"] == 0.123456
+
+
+def test_weight_n_above_six_implies_leading_fractional_zeros():
+    # int("000001") / 10**9 = 0.000000001 (n-6 leading zeros are implied)
+    resp = parse("3109000001")
+    assert resp.json()["elements"][0]["decimal_value"] == 0.000000001
+    resp = parse("3207000001")
+    assert resp.json()["elements"][0]["decimal_value"] == 0.0000001
+
+
+def test_weight_zero_value():
+    for ai in ("3100", "3105", "3209"):
+        resp = parse(f"{ai}000000")
+        assert resp.status_code == 200
+        element = resp.json()["elements"][0]
+        assert element["value"] == "000000"
+        assert element["decimal_value"] == 0.0
+        assert element["unit"] == ("kg" if ai.startswith("310") else "lb")
+
+
+def test_weight_fixed_field_needs_no_separator_after_fixed_fields():
+    resp = parse(f"01{GTIN_OK}172501313101012345")
+    assert resp.status_code == 200
+    elements = resp.json()["elements"]
+    assert [e["ai"] for e in elements] == ["01", "17", "3101"]
+    weight = elements[-1]
+    assert weight["offset"] == 24
+    assert weight["value"] == "012345"
+    assert weight["decimal_value"] == 1234.5
+    assert weight["unit"] == "kg"
+
+
+def test_weight_followed_by_variable_field_needs_no_separator():
+    # Weight fields are self-delimiting by their fixed length, just like
+    # AI 01/17, so a following variable-length field needs no separator.
+    resp = parse("310212345610ABC")
+    assert resp.status_code == 200
+    elements = resp.json()["elements"]
+    assert [e["ai"] for e in elements] == ["3102", "10"]
+    assert elements[0]["decimal_value"] == 1234.56
+    assert elements[0]["unit"] == "kg"
+    assert elements[1]["value"] == "ABC"
+
+
+def test_weight_separator_directly_after_fixed_field_rejected_like_01_17():
+    # Same rule as the other fixed-length AIs: an FNC1 separator placed
+    # right after the 6 digits is unexpected.
+    resp = parse(f"3102123456{GS}10ABC")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "UNEXPECTED_SEPARATOR"
+    assert detail["offset"] == 10
+
+
+def test_weight_at_end_after_variable_field():
+    resp = parse(f"21SN0001{GS}3203002513")
+    assert resp.status_code == 200
+    elements = resp.json()["elements"]
+    assert [e["ai"] for e in elements] == ["21", "3203"]
+    assert elements[1]["decimal_value"] == 2.513
+    assert elements[1]["unit"] == "lb"
+    assert elements[1]["offset"] == 9
+
+
+def test_non_weight_elements_have_no_decimal_value_or_unit():
+    resp = parse(f"01{GTIN_OK}17250131")
+    for element in resp.json()["elements"]:
+        assert "decimal_value" not in element
+        assert "unit" not in element
+
+
+def test_weight_four_char_ai_wins_longest_match():
+    # "3110..." must not be read as weight (only prefixes 310/320 are);
+    # it falls back to the 2-character AI "31", which is unsupported.
+    resp = parse("3110000000")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "UNSUPPORTED_AI"
+    assert detail["found"] == "31"
+    assert detail["offset"] == 0
+
+
+def test_weight_missing_precision_digit_element_string():
+    resp = parse("310")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["offset"] == 3  # end of the raw input
+    assert "310n" in detail["expected"]
+
+
+def test_weight_missing_precision_before_separator():
+    resp = parse(f"320{GS}17250131")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["offset"] == 3
+    assert detail["found"] == "<GS>"
+
+
+def test_weight_non_digit_precision_element_string():
+    resp = parse("310A002513")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["offset"] == 3  # byte offset of the precision digit
+    assert detail["found"] == "A"
+    assert "precision" in detail["message"]
+
+
+def test_weight_value_too_short_element_string():
+    resp = parse("310300251")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "FIELD_TOO_SHORT"
+    assert detail["offset"] == 9  # end of raw input
+    assert "6" in detail["expected"]
+
+
+def test_weight_value_too_short_with_separator():
+    resp = parse(f"31030025{GS}17250131")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "FIELD_TOO_SHORT"
+    assert detail["offset"] == 8  # byte offset of the separator
+    assert detail["found"] == "<GS>"
+
+
+def test_weight_non_digit_value_element_string():
+    resp = parse("31030025A3")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_CHARACTER"
+    assert detail["offset"] == 8  # byte offset of 'A'
+    assert detail["found"] == "A"
+    assert "3103" in detail["message"]
+
+
+def test_weight_ai_offset_after_fixed_field():
+    resp = parse("172501313203002513")
+    assert resp.status_code == 200
+    element = resp.json()["elements"][1]
+    assert element["ai"] == "3203"
+    assert element["offset"] == 8
+    assert element["decimal_value"] == 2.513
+
+
 def test_batch_too_long():
     resp = parse("10" + "A" * 21)
     assert resp.status_code == 422
@@ -256,11 +443,11 @@ def test_digital_link_unknown_ai_in_path():
 
 
 def test_digital_link_unknown_longer_numeric_ai():
-    resp = parse(f"{DL_BASE}/310/123")
+    resp = parse(f"{DL_BASE}/999/abc")
     assert resp.status_code == 422
     detail = resp.json()["detail"]
     assert detail["error"] == "UNSUPPORTED_AI"
-    assert detail["found"] == "310"
+    assert detail["found"] == "999"
 
 
 def test_digital_link_unknown_ai_in_query():
@@ -420,3 +607,129 @@ def test_digital_link_non_uri_still_parsed_as_element_string():
     assert parse("21httpsniffed").status_code == 200
     resp = parse(f"01{GTIN_OK}17250131")
     assert resp.status_code == 200
+
+
+# --------------------------------- Digital Link: weight family 310n / 320n
+
+
+def test_digital_link_weight_in_path():
+    resp = parse(f"{DL_BASE}/01/{GTIN_OK}/3103/002513")
+    assert resp.status_code == 200
+    elements = resp.json()["elements"]
+    assert [e["ai"] for e in elements] == ["01", "3103"]
+    weight = elements[1]
+    assert weight["value"] == "002513"
+    assert weight["decimal_value"] == 2.513
+    assert weight["unit"] == "kg"
+    assert weight["offset"] == 37  # first byte of "3103" in the raw URI
+
+
+def test_digital_link_weight_in_query():
+    resp = parse(f"{DL_BASE}?3202=002513")
+    assert resp.status_code == 200
+    element = resp.json()["elements"][0]
+    assert element == {
+        "ai": "3202",
+        "name": "NET WEIGHT (LB)",
+        "value": "002513",
+        "decimal_value": 25.13,
+        "unit": "lb",
+        "offset": 19,  # byte offset of the query key "3202"
+    }
+
+
+def test_digital_link_weight_path_and_query_same_validation():
+    resp = parse(f"{DL_BASE}/3101/012345?3204=002513")
+    assert resp.status_code == 200
+    elements = resp.json()["elements"]
+    assert [e["ai"] for e in elements] == ["3101", "3204"]
+    assert elements[0]["decimal_value"] == 1234.5
+    assert elements[0]["unit"] == "kg"
+    assert elements[1]["decimal_value"] == 0.2513
+    assert elements[1]["unit"] == "lb"
+
+
+def test_digital_link_weight_missing_precision_path():
+    resp = parse(f"{DL_BASE}/310/002513")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["offset"] == 22  # byte just after "310" in the raw URI
+    assert detail["found"] == "310"
+    assert "precision" in detail["message"]
+
+
+def test_digital_link_weight_missing_precision_query():
+    resp = parse(f"{DL_BASE}?320=002513")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["found"] == "320"
+
+
+def test_digital_link_weight_non_digit_precision():
+    resp = parse(f"{DL_BASE}/310x/002513")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["offset"] == 22  # the "x" inside the raw URI
+    assert detail["found"] == "x"
+
+
+def test_digital_link_weight_value_too_short():
+    resp = parse(f"{DL_BASE}/3103/00251")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "FIELD_TOO_SHORT"
+    assert detail["offset"] == 29  # end of the raw value segment
+
+
+def test_digital_link_weight_value_too_long():
+    resp = parse(f"{DL_BASE}/3103/0025136")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "FIELD_TOO_LONG"
+    assert detail["offset"] == 30  # 7th digit of the value segment
+
+
+def test_digital_link_weight_non_digit_value():
+    resp = parse(f"{DL_BASE}/3103/0025A3")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_CHARACTER"
+    assert detail["offset"] == 28  # raw byte offset of 'A'
+    assert detail["found"] == "A"
+
+
+def test_digital_link_weight_duplicate_same_ai_rejected():
+    resp = parse(f"{DL_BASE}/3103/002513?3103=000001")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "DUPLICATE_AI"
+
+
+def test_digital_link_weight_kg_and_lb_are_distinct_ais():
+    # 3103 and 3203 differ by family, not precision, so both are allowed.
+    resp = parse(f"{DL_BASE}/3103/002513/3203/002513")
+    assert resp.status_code == 200
+    elements = resp.json()["elements"]
+    assert [e["unit"] for e in elements] == ["kg", "lb"]
+
+
+def test_digital_link_weight_percent_decoded_precision_digit():
+    # "%33" == "3", so "310%33" decodes to AI "3103" (precision digit encoded)
+    resp = parse(f"{DL_BASE}/310%33/002513")
+    assert resp.status_code == 200
+    element = resp.json()["elements"][0]
+    assert element["ai"] == "3103"
+    assert element["decimal_value"] == 2.513
+
+
+def test_digital_link_weight_percent_encoded_bad_precision_offset():
+    # "%41" == "A"; the error offset points at the '%' of its encoding.
+    resp = parse(f"{DL_BASE}/310%41/002513")
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "INVALID_PRECISION"
+    assert detail["found"] == "A"
+    assert detail["offset"] == 22
