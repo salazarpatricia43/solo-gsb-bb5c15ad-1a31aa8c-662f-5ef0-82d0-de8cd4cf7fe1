@@ -1,14 +1,19 @@
 """GS1 element-string and Digital Link URI parser.
 
-Supports AI 01 (GTIN-14), AI 10 (batch/lot), AI 17 (expiry date) and
-AI 21 (serial number).
+Supports AI 01 (GTIN-14), AI 10 (batch/lot), AI 17 (expiry date),
+AI 21 (serial number) and the weight-AI family AI 310n (net weight,
+kilograms) and AI 320n (net weight, pounds), where the fourth digit
+``n`` (0-9) is the number of implied decimal places and the value is a
+fixed 6-digit number.
 
 Two input forms are accepted by :func:`parse`:
 
 1. Raw GS1 element strings as emitted by scanners. Fixed-length fields
-   (01, 17) are delimited implicitly by their length; variable-length
-   fields (10, 21) must be terminated by the FNC1 separator (ASCII 29,
-   GS) unless they are the last field in the string.
+   (01, 17, 310n, 320n) are delimited implicitly by their length;
+   variable-length fields (10, 21) must be terminated by the FNC1
+   separator (ASCII 29, GS) unless they are the last field in the
+   string. The four-digit weight identifiers are recognized by
+   longest match ahead of the two-digit AIs.
 
 2. GS1 Digital Link URIs (``http://`` / ``https://``).  AI/value pairs
    are read from the URI path (``/AI/value/AI/value``) first and then
@@ -47,14 +52,45 @@ class AISpec:
     fixed_length: bool
     charset: frozenset
     charset_rule: str
+    # Weight-AI family only: the fourth digit carries the number of implied
+    # decimal places and the fixed-length value is interpreted as a quantity.
+    decimal_places: int | None = None
+    unit: str | None = None
 
 
-AI_SPECS = {
-    "01": AISpec("01", "GTIN", 14, 14, True, DIGITS, "digits 0-9"),
-    "17": AISpec("17", "EXPIRY", 6, 6, True, DIGITS, "digits 0-9"),
-    "10": AISpec("10", "BATCH/LOT", 1, 20, False, AI82, "GS1 AI character set 82"),
-    "21": AISpec("21", "SERIAL", 1, 20, False, AI82, "GS1 AI character set 82"),
+# AI families whose identifier is four digits: (3-digit family prefix,
+# (unit name, unit symbol))
+WEIGHT_AI_FAMILIES = {
+    "310": ("NET WEIGHT", "kg"),
+    "320": ("NET WEIGHT", "lb"),
 }
+
+
+def _build_ai_specs():
+    specs = {
+        "01": AISpec("01", "GTIN", 14, 14, True, DIGITS, "digits 0-9"),
+        "17": AISpec("17", "EXPIRY", 6, 6, True, DIGITS, "digits 0-9"),
+        "10": AISpec("10", "BATCH/LOT", 1, 20, False, AI82, "GS1 AI character set 82"),
+        "21": AISpec("21", "SERIAL", 1, 20, False, AI82, "GS1 AI character set 82"),
+    }
+    for base, (name, unit) in WEIGHT_AI_FAMILIES.items():
+        for decimals in range(10):  # 310n / 320n, n = 0..9
+            ai = f"{base}{decimals}"
+            specs[ai] = AISpec(
+                ai,
+                f"{name} ({unit})",
+                6,
+                6,
+                True,
+                DIGITS,
+                "digits 0-9",
+                decimal_places=decimals,
+                unit=unit,
+            )
+    return specs
+
+
+AI_SPECS = _build_ai_specs()
 
 SUPPORTED_AIS = ", ".join(sorted(AI_SPECS))
 
@@ -88,11 +124,28 @@ class Element:
     name: str
     value: str
     offset: int  # byte offset of the AI within the input
+    # Present only for the weight-AI family (310n / 320n).
+    decimal_value: float | None = None
+    unit: str | None = None
 
 
 def _byte_offset(data: str, index: int) -> int:
     """Byte offset (UTF-8) of the character at ``index``."""
     return len(data[:index].encode("utf-8"))
+
+
+def _build_element(spec: AISpec, value: str, ai_offset: int) -> Element:
+    """Build an element, decoding the weight value when the AI is a measure."""
+    if spec.decimal_places is None:
+        return Element(ai=spec.ai, name=spec.name, value=value, offset=ai_offset)
+    return Element(
+        ai=spec.ai,
+        name=spec.name,
+        value=value,
+        offset=ai_offset,
+        decimal_value=int(value) / (10 ** spec.decimal_places),
+        unit=spec.unit,
+    )
 
 
 def parse(data: str) -> list[Element]:
@@ -122,28 +175,10 @@ def _parse_element_string(data: str) -> list[Element]:
                 "UNEXPECTED_SEPARATOR",
                 "Unexpected separator (ASCII 29); expected an application identifier",
                 offset=ai_offset,
-                expected=f"2-digit AI, one of: {SUPPORTED_AIS}",
+                expected=f"numeric AI, one of: {SUPPORTED_AIS}",
                 found="<GS>",
             )
-        ai = data[pos : pos + 2]
-        if len(ai) < 2 or not all(c in DIGITS for c in ai):
-            raise GS1ParseError(
-                "INVALID_AI",
-                f"Expected a 2-digit application identifier, found {ai!r}",
-                offset=ai_offset,
-                expected=f"2-digit AI, one of: {SUPPORTED_AIS}",
-                found=ai,
-            )
-        spec = AI_SPECS.get(ai)
-        if spec is None:
-            raise GS1ParseError(
-                "UNSUPPORTED_AI",
-                f"Unsupported application identifier '{ai}'",
-                offset=ai_offset,
-                expected=f"one of: {SUPPORTED_AIS}",
-                found=ai,
-            )
-        pos += 2
+        spec, pos = _identify_ai_element_string(data, pos)
         value_pos = pos
 
         if spec.fixed_length:
@@ -159,10 +194,83 @@ def _parse_element_string(data: str) -> list[Element]:
         elif spec.ai == "17":
             _check_date(value, offsets)
 
-        elements.append(
-            Element(ai=spec.ai, name=spec.name, value=value, offset=ai_offset)
-        )
+        elements.append(_build_element(spec, value, ai_offset))
     return elements
+
+
+def _identify_ai_element_string(data: str, pos: int) -> tuple[AISpec, int]:
+    """Read a numeric AI at ``pos`` using longest-match recognition.
+
+    Up to four digits are scanned: a known four-digit identifier (the
+    310n/320n weight family) always wins; otherwise the first two
+    digits name the AI. A bare three-digit weight-family prefix is a
+    weight identifier missing its precision digit.
+    """
+    ai_offset = _byte_offset(data, pos)
+
+    # The run of up to four consecutive digits starting at ``pos``.
+    j = pos
+    limit = min(len(data), pos + 4)
+    while j < limit and data[j] in DIGITS:
+        j += 1
+    run = data[pos:j]
+
+    if len(run) < 2:
+        ai = data[pos : min(len(data), pos + 2)]
+        raise GS1ParseError(
+            "INVALID_AI",
+            f"Expected a numeric application identifier, found {ai!r}",
+            offset=ai_offset,
+            expected=f"numeric AI, one of: {SUPPORTED_AIS}",
+            found=ai,
+        )
+
+    if len(run) == 4:
+        spec = AI_SPECS.get(run)
+        if spec is not None:
+            return spec, j
+        # No four-digit AI starts here: the four digits are the 2-digit AI
+        # plus the first two value characters (e.g. "17" + "25" in 17250131).
+        ai = run[:2]
+        spec = AI_SPECS.get(ai)
+        if spec is not None:
+            return spec, pos + 2
+        raise GS1ParseError(
+            "UNSUPPORTED_AI",
+            f"Unsupported application identifier '{run}'",
+            offset=ai_offset,
+            expected=f"one of: {SUPPORTED_AIS}",
+            found=run,
+        )
+
+    # A run of three digits (input ended, a separator, or a non-digit
+    # follows). It only identifies a weight family missing its precision
+    # digit; otherwise the first two digits name the AI.
+    if run in WEIGHT_AI_FAMILIES:
+        found = "<GS>" if j < len(data) and data[j] == GS else (
+            data[j] if j < len(data) else "<end of input>"
+        )
+        raise GS1ParseError(
+            "INVALID_PRECISION",
+            f"AI '{run}' is a weight identifier but is missing its precision "
+            f"digit n (0-9), found {found!r}",
+            offset=_byte_offset(data, j),
+            expected="precision digit n in 0-9 completing the 4-digit AI "
+            f"{run}n (310n = kg, 320n = lb)",
+            found=found,
+        )
+
+    ai = run[:2]
+    spec = AI_SPECS.get(ai)
+    if spec is None:
+        raise GS1ParseError(
+            "UNSUPPORTED_AI",
+            f"Unsupported application identifier '{ai}'",
+            offset=ai_offset,
+            expected=f"one of: {SUPPORTED_AIS}",
+            found=ai,
+        )
+    return spec, pos + 2
 
 
 def _read_fixed(data, pos, spec):
@@ -342,15 +450,7 @@ def _parse_digital_link(data: str) -> list[Element]:
                 expected=f"numeric AI, one of: {SUPPORTED_AIS}",
                 found=raw_ai,
             )
-        spec = AI_SPECS.get(ai)
-        if spec is None:
-            raise GS1ParseError(
-                "UNSUPPORTED_AI",
-                f"Unsupported application identifier '{ai}' in the {location}",
-                offset=ai_byte,
-                expected=f"one of: {SUPPORTED_AIS}",
-                found=ai,
-            )
+        spec = _resolve_uri_ai(ai, data, ai_start, ai_end, location)
         if ai in seen:
             first_offset, first_location = seen[ai]
             if first_location == location:
@@ -375,9 +475,7 @@ def _parse_digital_link(data: str) -> list[Element]:
 
         value, offsets = _percent_decode(data, val_start, val_end)
         _validate_uri_value(spec, value, offsets, _byte_offset(data, val_end))
-        elements.append(
-            Element(ai=spec.ai, name=spec.name, value=value, offset=ai_byte)
-        )
+        elements.append(_build_element(spec, value, ai_byte))
 
     for k in range(0, len(segments), 2):
         consume(segments[k], segments[k + 1], "URI path")
@@ -385,6 +483,36 @@ def _parse_digital_link(data: str) -> list[Element]:
         consume(key_span, value_span, "query string")
 
     return elements
+
+
+def _resolve_uri_ai(ai, data, ai_start, ai_end, location):
+    """Resolve a percent-decoded, all-numeric URI AI to a spec.
+
+    Applies the same longest-match rule as element strings: an exact
+    4-digit weight identifier wins; a bare 3-digit weight family prefix
+    is reported as a missing/illegal precision digit.
+    """
+    ai_byte = _byte_offset(data, ai_start)
+    spec = AI_SPECS.get(ai)
+    if spec is not None:
+        return spec
+    if len(ai) == 3 and ai in WEIGHT_AI_FAMILIES:
+        raise GS1ParseError(
+            "INVALID_PRECISION",
+            f"AI '{ai}' in the {location} is a weight identifier but is missing "
+            "its precision digit n (0-9)",
+            offset=_byte_offset(data, ai_end),
+            expected=f"precision digit n in 0-9 completing the 4-digit AI {ai}n "
+            "(310n = kg, 320n = lb)",
+            found="<end of key>",
+        )
+    raise GS1ParseError(
+        "UNSUPPORTED_AI",
+        f"Unsupported application identifier '{ai}' in the {location}",
+        offset=ai_byte,
+        expected=f"one of: {SUPPORTED_AIS}",
+        found=ai,
+    )
 
 
 def _split_path(data, start, end):

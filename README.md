@@ -29,15 +29,28 @@ docker compose up --build
 | 17   | 效期 YYMMDD | 固定 6 位数字   | 0-9，校验真实日期（含闰年）     |
 | 10   | 批号        | 可变 1-20 字符  | GS1 AI 字符集 82                |
 | 21   | 序列号      | 可变 1-20 字符  | GS1 AI 字符集 82                |
+| 310n | 净重（千克）| 固定 6 位数字   | 0-9，n=0～9 为隐含小数位数      |
+| 320n | 净重（磅）  | 固定 6 位数字   | 0-9，n=0～9 为隐含小数位数      |
+
+`310n` / `320n` 是四位应用标识符：第四位 `n` 给出值的隐含小数位数（0～9），
+其后紧跟固定 6 位数字。例如 `3102001234` 中 AI 为 `3102`、原始值 `value` 为
+`001234`，实际重量 = 1234 ÷ 10² = **12.34 kg**；`3201029000` 为 **2900.0 lb**。
+响应中这两个族的元素除保留原始 `value` 外，还会返回数值型 `decimal_value`
+与字符串 `unit`（`kg` 或 `lb`）；其余 AI 不包含这两个字段。
 
 解析规则：
 
-- 固定长度字段（01、17）按长度自动定界，无需分隔符。
+- AI 按**最长可匹配**识别：先尝试匹配四位标识符（310n/320n 族），不命中再回退到
+  两位 AI（01/10/17/21），因此四位标识符与两位 AI 无需分隔符即可邻接。
+- 固定长度字段（01、17、310n、320n）按长度自动定界，无需分隔符。
 - 可变长度字段（10、21）除位于串末尾外，必须以分隔符 ASCII 29（GS，扫码枪 FNC1）
   结束；JSON 中以 `\u001d` 表示。
 - AI 17 的日字段为 `00` 时按 GS1 规范表示当月最后一天；年份按 20YY 解释。
+- 仅出现 `310` / `320` 三位前缀而缺少第 4 位精度位（输入结束、遇分隔符或为
+  非数字字符）时返回 `422 INVALID_PRECISION`；6 位值位数不足返回
+  `FIELD_TOO_SHORT`，值中含非数字字符返回 `INVALID_CHARACTER`。
 - `data` 以 `http://` 或 `https://` 开头时按 GS1 Digital Link URI 解析，否则按
-  元素串解析。
+  元素串解析，两种输入行为一致。
 
 ### Digital Link URI 规则
 
@@ -75,6 +88,28 @@ curl -X POST http://localhost:8080/parse \
   ]
 }
 ```
+
+重量 AI（310n/320n）的响应额外携带 `decimal_value` 与 `unit`，且固定长度字段
+无需分隔符即可与其他 AI 邻接：
+
+```bash
+curl -X POST http://localhost:8080/parse \
+  -H "Content-Type: application/json" \
+  -d '{"data": "01095011015300033102001234"}'
+```
+
+```json
+{
+  "elements": [
+    { "ai": "01",   "name": "GTIN",           "value": "09501101530003", "offset": 0 },
+    { "ai": "3102", "name": "NET WEIGHT (kg)","value": "001234", "offset": 16,
+      "decimal_value": 12.34, "unit": "kg" }
+  ]
+}
+```
+
+`decimal_value` 是把原始 6 位数字除以 10ⁿ 得到的 JSON 数值（n=0 时例如
+`23000.0`），`value` 始终保留原始 6 位字符串。
 
 ### GS1 Digital Link URI
 
@@ -120,6 +155,27 @@ curl -X POST http://localhost:8080/parse \
 
 解码后批号为 `Lot/A/100`，返回 `200`。
 
+重量 AI 在 Digital Link 中的行为与元素串完全一致（路径或查询参数均可）：
+
+```bash
+curl -X POST http://localhost:8080/parse \
+  -H "Content-Type: application/json" \
+  -d '{"data": "https://id.gs1.org/01/09501101530003/3201/029000"}'
+```
+
+```json
+{
+  "elements": [
+    { "ai": "01",   "name": "GTIN",            "value": "09501101530003", "offset": 19 },
+    { "ai": "3201", "name": "NET WEIGHT (lb)", "value": "029000", "offset": 37,
+      "decimal_value": 2900.0, "unit": "lb" }
+  ]
+}
+```
+
+不同精度位的 AI 视为不同标识符（如 `3101` 与 `3102` 可同时出现），但同一完整
+AI 仍受重复校验约束。
+
 路径段必须成对，例如 `.../01/09501101530003/17` 会返回 `422`
 （`UNPAIRED_PATH`）；同一 AI 不能重复，也不能同时出现在路径和查询参数中
 （`DUPLICATE_AI`）。
@@ -153,9 +209,10 @@ curl -X POST http://localhost:8080/parse \
 | ---------------------- | ------------------------------------------------------------- |
 | `EMPTY_INPUT`          | 输入为空（元素串为空，或 URI 路径/查询中没有任何 AI/值对）    |
 | `UNEXPECTED_SEPARATOR` | 在应出现 AI 的位置遇到分隔符（仅元素串）                      |
-| `INVALID_AI`           | 不是合法的数字 AI（元素串为非 2 位数字；URI 为非数字段/键）   |
-| `UNSUPPORTED_AI`       | 不支持的 AI（仅支持 01/10/17/21）                             |
-| `FIELD_TOO_SHORT`      | 固定长度字段字符不足                                          |
+| `INVALID_AI`           | 不是合法的数字 AI（元素串不足 2 位数字；URI 为非数字段/键）   |
+| `UNSUPPORTED_AI`       | 不支持的 AI（仅支持 01/10/17/21 与 310n/320n）                |
+| `INVALID_PRECISION`    | `310`/`320` 族缺少第 4 位精度位 n（缺失或为非数字字符）       |
+| `FIELD_TOO_SHORT`      | 固定长度字段字符不足（含 310n/320n 的 6 位值不足）            |
 | `FIELD_EMPTY`          | 可变长度字段为空                                              |
 | `FIELD_TOO_LONG`       | 可变长度字段超过 20 字符（或固定长度字段超长，仅 URI）        |
 | `INVALID_CHARACTER`    | 字符不符合该字段字符集                                        |
